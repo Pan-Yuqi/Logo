@@ -1,0 +1,38 @@
+{
+  "architectures": [
+    "LoGoForCausalLM"
+  ],
+  "model_type": "logo",
+  "vocab_size": 155136,
+  "hidden_size": 2048,
+  "intermediate_size": 5632,
+  "num_hidden_layers": 24,
+  "num_attention_heads": 16,
+  "num_key_value_heads": 16,
+  "hidden_act": "silu",
+  "max_position_embeddings": 8192,
+  "initializer_range": 0.02,
+  "rms_norm_eps": 1e-05,
+  "layer_norm_eps": null,
+  "attention_bias": false,
+  "attention_out_bias": false,
+  "attention_dropout": 0.0,
+  "mlp_bias": false,
+  "resid_pdrop": 0.0,
+  "rope_theta": 10000.0,
+  "rope_scaling": null,
+  "attn_type_list": [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  ],
+  "window_size": 128,
+  "global_qk_param": "linear_proj",
+  "sparse_full_attn_backend": "flash",
+  "gate_thres_init": -2.0,
+  "use_context_norm": true,
+  "bos_token_id": 0,
+  "eos_token_id": 2,
+  "tie_word_embeddings": true,
+  "torch_dtype": "bfloat16",
+  "use_cache": true
+}
