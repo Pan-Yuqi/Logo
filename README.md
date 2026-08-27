@@ -1,32 +1,29 @@
 # LoGo: Token-Level Dynamic Local-Global Attention
 
-LoGo is a token-level dynamic local-global attention mechanism that uses
-**attention span as a direct proxy for attention budget allocation**. As context
-lengths scale, attention becomes a primary computational bottleneck: standard
-Transformers spend the same attention budget on every token regardless of its
-contextual demand. LoGo instead lets each token decide how much context it needs.
+LoGo is a token-level dynamic local-global attention mechanism for improving
+the long-context performance-compute trade-off of decoder-only language models.
+It uses attention span as a direct proxy for attention budget allocation: every
+token receives efficient local attention, while a learned gate selectively
+activates full-context global attention for tokens requiring long-range
+information.
 
-Each LoGo layer contains **coupled local and global branches**:
+![LoGo overview](assets/logo_main.png)
 
-- **Local branch** — *every* token receives efficient sliding-window (SWA)
-  attention over a restricted context window.
-- **Global branch** — a learned per-token scalar **gate** activates full-context
-  attention only for the tokens that require long-range information.
+## Highlights
 
-The two branches are combined per token:
+- **Token-level span allocation.** LoGo routes each token between local-only and
+  local-plus-global attention under a controlled global budget.
+- **Coupled local/global branches.** The two branches share the main attention
+  projections and use lightweight transformations for branch specialization.
+- **Budget control without auxiliary loss.** A threshold-based controller keeps
+  the global activation ratio near a target budget.
+- **Stable sparse routing.** Progressive masking lets the gate and both branches
+  learn from dense supervision before sparse global routing takes effect.
+- **Query-sparse implementation.** Triton kernels compute the global branch only
+  for selected query rows, turning reduced attention FLOPs into practical
+  speedups.
 
-```
-gate = sigmoid(gate_proj(hidden_states))
-out  = (1 - gate) * local_out + gate * global_out
-```
-
-A threshold-based budget controller maintains a target global ratio without any
-auxiliary loss, and **query-sparse Triton kernels** turn the reduced
-global-attention computation into practical speedups. Because span allocation is
-shared per layer, LoGo does not introduce head-level imbalance and remains
-compatible with efficient tensor / sequence parallelism.
-
-## Repository layout
+## Repository Layout
 
 ```
 LoGo/
@@ -34,40 +31,47 @@ LoGo/
 │   ├── __init__.py                 # package exports + Auto* registration
 │   ├── configuration_logo.py       # LoGoConfig
 │   ├── modeling_logo.py            # LoGoModel / LoGoForCausalLM
-│   ├── cache.py                    # dual-branch (local + global) KV cache
-│   ├── modules/                    # reusable building blocks
-│   │   ├── layernorm.py            #   RMSNorm
-│   │   ├── rotary.py               #   RotaryEmbedding + apply_rotary_pos_emb
-│   │   └── mlp.py                  #   SwiGLU MLP
-│   ├── layers/                     # attention layers
-│   │   ├── attn.py                 #   standard full flash-attention
-│   │   ├── logo.py                 #   LoGoAttention (local + gated global)
-│   │   └── utils.py                #   flash-attention forward dispatch
-│   └── ops/                        # self-contained Triton operators
-│       ├── selected_full_attn.py   #   sq_full_attn: query-sparse full attention
-│       ├── dense_full_attn.py      #   dense references for testing
-│       ├── common.py               #   selection / launch helpers
-│       └── triton_utils.py         #   inlined Triton helpers
+│   ├── cache.py                    # local/global KV cache utilities
+│   ├── layers/
+│   │   ├── attn.py                 # standard full-attention layer
+│   │   ├── logo.py                 # LoGo attention layer
+│   │   └── utils.py                # flash-attention dispatch helpers
+│   ├── modules/
+│   │   ├── layernorm.py            # RMSNorm
+│   │   ├── rotary.py               # rotary position embedding
+│   │   └── mlp.py                  # SwiGLU MLP
+│   └── ops/
+│       ├── selected_full_attn.py   # query-sparse full attention
+│       ├── dense_full_attn.py      # dense reference implementation
+│       ├── common.py               # selection and launch helpers
+│       └── triton_utils.py         # Triton helper functions
 ├── configs/
-│   └── config_1b5.json             # 1.5B reference configuration
+│   └── config_1b5.json             # reference 1.5B configuration
 ├── tests/
-│   └── test_model.py               # import / build / forward smoke tests
-├── setup.py
+│   └── test_model.py               # build / forward / generation smoke test
 ├── requirements.txt
-└── README.md
+├── setup.py
+└── LICENSE
 ```
 
 ## Installation
 
 ```bash
+git clone <repo-url>
 cd LoGo
 pip install -e .
-# Flash-attention is required for the attention layers at runtime:
 pip install flash-attn --no-build-isolation
 ```
 
-Requirements: `torch>=2.1`, `transformers>=4.44,<4.52`, `triton>=3.0`,
-`einops>=0.7`, and `flash-attn>=2.1`.
+Main requirements:
+
+- Python >= 3.9
+- PyTorch >= 2.1
+- Transformers >= 4.44 and < 4.52
+- Triton >= 3.0
+- flash-attn >= 2.1
+
+The flash-attention and Triton paths require a CUDA GPU.
 
 ## Quickstart
 
@@ -83,19 +87,19 @@ config = LoGoConfig(
     num_attention_heads=16,
     num_key_value_heads=16,
     max_position_embeddings=8192,
-    window_size=128,                     # local (SWA) window
-    global_qk_param="linear_proj",       # global-branch q/k/v re-parameterization
-    sparse_full_attn_backend="flash",    # "flash" (dense) or "triton" (query-sparse)
-    gate_thres_init=0.5,                 # token-level span budget threshold
+    window_size=128,
+    global_qk_param="linear_proj",
+    sparse_full_attn_backend="flash",
+    gate_thres_init=0.5,
 )
 
 model = LoGoForCausalLM(config).cuda().to(torch.bfloat16)
 input_ids = torch.randint(0, config.vocab_size, (1, 512), device="cuda")
-out = model(input_ids)
-print(out.logits.shape)  # [1, 512, vocab_size]
+outputs = model(input_ids)
+print(outputs.logits.shape)
 ```
 
-Loading the reference config:
+You can also load the reference configuration:
 
 ```python
 from logo import LoGoConfig, LoGoForCausalLM
@@ -104,35 +108,39 @@ config = LoGoConfig.from_pretrained("configs/config_1b5.json")
 model = LoGoForCausalLM(config)
 ```
 
-Because the model registers itself with the `transformers` Auto classes on
-import, `AutoConfig`/`AutoModelForCausalLM` also work once `import logo` has run.
+The package registers `LoGoConfig` and `LoGoForCausalLM` with the Hugging Face
+Auto classes when `logo` is imported.
 
-## Key configuration options
+## Key Configuration Options
 
 | Field | Default | Description |
-|-------|---------|-------------|
+|---|---:|---|
 | `window_size` | `128` | Sliding-window size for the local branch. |
-| `attn_type_list` | all `0` | Per-layer type: `0` = LoGo attention, else standard attention. |
-| `global_qk_param` | `"scale_offset"` | Global-branch q/k/v transform: `scale_offset` (per-channel affine) or `linear_proj` (per-head mixing matrix). |
-| `sparse_full_attn_backend` | `"flash"` | Global branch backend: `flash` (dense) or `triton` (query-sparse). |
-| `gate_thres_init` | `0.5` | Initial gate threshold for the token-level span budget. |
-| `use_context_norm` | `True` | Per-branch RMSNorm on the attention context before gating. |
+| `attn_type_list` | all `0` | Per-layer attention type. `0` selects LoGo attention; other values select standard full attention. |
+| `global_qk_param` | `"scale_offset"` | Global-branch Q/K/V transformation: `"scale_offset"` or `"linear_proj"`. |
+| `sparse_full_attn_backend` | `"flash"` | Global branch backend: dense flash attention (`"flash"`) or query-sparse Triton (`"triton"`). |
+| `gate_thres_init` | `0.5` | Initial threshold for token-level global activation. |
+| `use_context_norm` | `True` | Apply branch-specific RMSNorm before output fusion. |
 
-The `triton` backend (`sparse_full_attn_backend="triton"`) runs
-`logo.ops.sq_full_attn`, a selected-query full-attention kernel that only computes
-the rows chosen by the gate — this is where the reduced global-attention budget
-becomes a real speedup.
+Setting `sparse_full_attn_backend="triton"` enables `logo.ops.sq_full_attn`,
+which computes full-context attention only for selected query rows while
+preserving dense-attention semantics on those rows.
 
-## Testing
+## Smoke Test
 
 ```bash
-cd ./LoGo
-python tests/test_model.py          # GPU smoke test: build + train/packed/generate
+python tests/test_model.py
 ```
 
-The smoke test builds the reference model from `configs/config_1b5.json` and
-requires a CUDA GPU (flash-attention and the Triton kernels are GPU-only).
+The smoke test builds the reference model and checks regular training forward,
+packed variable-length forward with `cu_seqlens`, and generation paths. It
+requires a CUDA GPU with flash-attention and Triton installed.
+
+## Citation
+
+TODO: add BibTeX after the paper/arXiv version is available.
 
 ## License
 
-Apache License 2.0.
+This project is released under the Apache License 2.0. See [LICENSE](LICENSE)
+for details.
