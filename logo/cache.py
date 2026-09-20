@@ -19,8 +19,8 @@ class Cache(transformers.cache_utils.Cache):
     * ``attn_state``      -- key/value for the local (sliding-window) branch,
     * ``attn_state_full`` -- key/value for the global (full) branch.
 
-    The local branch optionally rolls its buffer when ``window_size`` is passed
-    through ``cache_kwargs`` so memory stays bounded during long decodes.
+    The local branch retains a rolling ``window_size`` buffer, while the global
+    branch keeps the full sequence.
     """
 
     is_compileable = True
@@ -70,42 +70,58 @@ class Cache(transformers.cache_utils.Cache):
         if attn_state is not None:
             if not isinstance(attn_state, tuple) or len(attn_state) != 2:
                 raise ValueError("`attn_state` must be a tuple of two tensors for key/value states")
-            input_size = attn_state[0].shape[-2]
             window_size = cache_kwargs.get("window_size", None)
+            if window_size is not None and window_size <= 0:
+                raise ValueError(f"`window_size` must be positive, got {window_size}")
+
+        attn_state_for_attention = attn_state
 
         if len(self.states) <= layer_idx:
             # first write for this layer
-            if attn_state is not None and window_size is not None and input_size > window_size:
-                attn_state = (
+            attn_state_to_cache = attn_state
+            if (
+                attn_state is not None
+                and window_size is not None
+                and attn_state[0].shape[-2] > window_size
+            ):
+                attn_state_to_cache = (
                     attn_state[0][..., -window_size:, :].contiguous(),
                     attn_state[1][..., -window_size:, :].contiguous(),
                 )
-            state = dict(attn_state=attn_state, attn_state_full=attn_state_full)
+            state = dict(attn_state=attn_state_to_cache, attn_state_full=attn_state_full)
             self.states.append(state)
         else:
             state = self.states[layer_idx]
             if attn_state is not None:
                 key_state, value_state = state["attn_state"]
-                if window_size is not None and key_state.shape[-2] == window_size:
-                    # Buffer is full: roll left by `input_size` instead of growing.
-                    key_state = key_state.roll(-input_size, -2)
-                    value_state = value_state.roll(-input_size, -2)
-                    key_state[..., -input_size:, :] = attn_state[0]
-                    value_state[..., -input_size:, :] = attn_state[1]
-                    attn_state = (key_state, value_state)
-                else:
-                    attn_state = (
-                        torch.cat([key_state, attn_state[0]], -2),
-                        torch.cat([value_state, attn_state[1]], -2),
-                    )
-                state["attn_state"] = attn_state
-            if attn_state_full is not None:
-                state["attn_state_full"] = (
-                    torch.cat([state["attn_state_full"][0], attn_state_full[0]], -2),
-                    torch.cat([state["attn_state_full"][1], attn_state_full[1]], -2),
+                attn_state_for_attention = (
+                    torch.cat([key_state, attn_state[0]], dim=-2),
+                    torch.cat([value_state, attn_state[1]], dim=-2),
                 )
+                attn_state_to_cache = attn_state_for_attention
+                if (
+                    window_size is not None
+                    and attn_state_for_attention[0].shape[-2] > window_size
+                ):
+                    attn_state_to_cache = (
+                        attn_state_for_attention[0][..., -window_size:, :].contiguous(),
+                        attn_state_for_attention[1][..., -window_size:, :].contiguous(),
+                    )
+                state["attn_state"] = attn_state_to_cache
+            if attn_state_full is not None:
+                if state["attn_state_full"] is None:
+                    state["attn_state_full"] = attn_state_full
+                else:
+                    state["attn_state_full"] = (
+                        torch.cat([state["attn_state_full"][0], attn_state_full[0]], dim=-2),
+                        torch.cat([state["attn_state_full"][1], attn_state_full[1]], dim=-2),
+                    )
 
-        return state
+        if attn_state_for_attention is None:
+            attn_state_for_attention = state["attn_state"]
+        output_state = state.copy()
+        output_state["attn_state"] = attn_state_for_attention
+        return output_state
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Return the number of cached tokens (0 if this layer has no state yet)."""
@@ -127,4 +143,13 @@ class Cache(transformers.cache_utils.Cache):
         if isinstance(past_key_values, (list, tuple)):
             for layer_idx in range(len(past_key_values)):
                 cache.states.append(past_key_values[layer_idx])
+
+            if seen_tokens == 0:
+                for state in cache.states:
+                    full_state = state.get("attn_state_full")
+                    local_state = state.get("attn_state")
+                    inferred_state = full_state if full_state is not None else local_state
+                    if inferred_state is not None:
+                        cache._seen_tokens = inferred_state[0].shape[-2]
+                        break
         return cache

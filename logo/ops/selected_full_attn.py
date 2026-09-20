@@ -1,23 +1,9 @@
 # -*- coding: utf-8 -*-
-# Selected-query full causal attention (the query-sparse global branch of LoGo).
-#
-# Only the query tokens selected by the per-token gate participate in the full
-# causal attention. Unselected query rows produce zero output / zero gradient,
-# so the compute cost scales with the *selected* fraction rather than the full
-# sequence length.
-#
-# Design:
-#   * Compressed queries are packed into a single "varlen-style" axis of length
-#     Sq, in ascending (sequence, position) order. `pos_ids[i]` is the real
-#     in-sequence position of compressed query i.
-#   * kv is NOT compressed; the kernel reads full kv and masks by real position.
-#   * Kernels use a SINGLE kv loop with the causal mask applied on EVERY block
-#     (using real positions). This makes the accumulation order identical to the
-#     dense reference (full selection), so selected rows match bitwise for o/dq.
-#
-# This file defines the Triton kernels, the autograd Function, and the public
-# wrapper `sq_full_attn`. The dense reference simply calls `sq_full_attn` with a
-# full (all-ones) selection -> see dense_full_attn.py.
+"""Selected-query full causal attention implemented in Triton.
+
+Selected queries are packed into a varlen axis while keys and values retain their
+full sequence layout. Causal masking uses each query's original position.
+"""
 
 from typing import Optional
 
@@ -44,9 +30,6 @@ from .triton_utils import (
 RCP_LN2 = 1.4426950216
 
 
-# ============================================================================
-# forward kernel
-# ============================================================================
 @triton.jit(do_not_specialize=['Tq_total'])
 def sq_full_attn_fwd_kernel(
     q,            # compressed queries [Sq, HQ, K]
@@ -87,35 +70,26 @@ def sq_full_attn_fwd_kernel(
     p_o = tl.make_block_ptr(o + (bos_q * HQ + i_hq) * V, (Tq, V), (HQ * V, 1), (i_tl * BT, i_v * BV), (BT, BV), (1, 0))
     p_lse = tl.make_block_ptr(lse + bos_q * HQ + i_hq, (Tq,), (HQ,), (i_tl * BT,), (BT,), (0,))
 
-    # real positions of the queries in this block
     o_qi = i_tl * BT + tl.arange(0, BT)
     m_q = o_qi < Tq
     b_pos = tl.load(pos_ids + bos_q + o_qi, mask=m_q, other=0).to(tl.int32)
 
-    # [BT, BK]
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_m = tl.full([BT], float('-inf'), dtype=tl.float32)
     b_acc = tl.zeros([BT], dtype=tl.float32)
 
-    # only iterate kv up to the max real position present in this query block
     max_pos = tl.max(tl.where(m_q, b_pos, 0))
-    # smallest real query position in this block: kv blocks strictly below it
-    # are fully causal for EVERY query in the block, so the causal `tl.where`
-    # is a no-op there and can be skipped.
     min_pos = tl.min(tl.where(m_q, b_pos, 2147483647))
     hi = (max_pos // BS + 1) * BS
     split = (min_pos // BS) * BS
 
-    # stage 1: kv blocks fully below min_pos -> no causal mask needed.
+    # KV blocks below min_pos are fully causal.
     for i_s in range(0, split, BS):
         p_k = tl.make_block_ptr(k + (bos_k * H + i_h) * K, (K, Tk), (1, H * K), (0, i_s), (BK, BS), (0, 1))
         p_v = tl.make_block_ptr(v + (bos_k * H + i_h) * V, (Tk, V), (H * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
-        # [BK, BS]
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        # [BS, BV]
         b_v = tl.load(p_v, boundary_check=(0, 1))
-        # [BT, BS]
         b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
 
         b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
@@ -124,19 +98,15 @@ def sq_full_attn_fwd_kernel(
         b_acc = b_acc * b_r + tl.sum(b_p, 1)
         b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
 
-    # stage 2: diagonal region -> apply causal mask on real positions.
+    # Apply the causal mask in the diagonal region.
     for i_s in range(split, hi, BS):
         o_k = i_s + tl.arange(0, BS)
         m_k = o_k < Tk
         p_k = tl.make_block_ptr(k + (bos_k * H + i_h) * K, (K, Tk), (1, H * K), (0, i_s), (BK, BS), (0, 1))
         p_v = tl.make_block_ptr(v + (bos_k * H + i_h) * V, (Tk, V), (H * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
-        # [BK, BS]
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        # [BS, BV]
         b_v = tl.load(p_v, boundary_check=(0, 1))
-        # [BT, BS]
         b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
-        # causal mask using REAL positions
         b_s = tl.where((b_pos[:, None] >= o_k[None, :]) & m_k[None, :] & m_q[:, None], b_s, float('-inf'))
 
         b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
@@ -151,9 +121,6 @@ def sq_full_attn_fwd_kernel(
     tl.store(p_lse, b_m.to(p_lse.dtype.element_ty), boundary_check=(0,))
 
 
-# ============================================================================
-# backward preprocess: delta = sum(o * do) over compressed rows
-# ============================================================================
 @triton.jit
 def sq_full_attn_bwd_preprocess_kernel(
     o,
@@ -171,9 +138,6 @@ def sq_full_attn_bwd_preprocess_kernel(
     tl.store(delta + i_n, b_delta.to(delta.dtype.element_ty))
 
 
-# ============================================================================
-# backward dq: mirrors fwd (single masked loop)
-# ============================================================================
 @triton.jit(do_not_specialize=['Tq_total'])
 def sq_full_attn_bwd_kernel_dq(
     q,
@@ -233,7 +197,7 @@ def sq_full_attn_bwd_kernel_dq(
     hi = (max_pos // BS + 1) * BS
     split = (min_pos // BS) * BS
 
-    # stage 1: kv blocks fully below min_pos -> no causal mask needed.
+    # KV blocks below min_pos are fully causal.
     for i_s in range(0, split, BS):
         p_k = tl.make_block_ptr(k + (bos_k * H + i_h) * K, (K, Tk), (1, H * K), (0, i_s), (BK, BS), (0, 1))
         p_v = tl.make_block_ptr(v + (bos_k * H + i_h) * V, (V, Tk), (1, H * V), (i_v * BV, i_s), (BV, BS), (0, 1))
@@ -241,13 +205,11 @@ def sq_full_attn_bwd_kernel_dq(
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
         b_p = exp2(b_s - b_lse[:, None])
-        # [BT, BV] @ [BV, BS] -> [BT, BS]
         b_dp = tl.dot(b_do, b_v)
         b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
-        # [BT, BS] @ [BS, BK] -> [BT, BK]
         b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
 
-    # stage 2: diagonal region -> apply causal mask on real positions.
+    # Apply the causal mask in the diagonal region.
     for i_s in range(split, hi, BS):
         o_k = i_s + tl.arange(0, BS)
         m_k = o_k < Tk
@@ -258,19 +220,14 @@ def sq_full_attn_bwd_kernel_dq(
         b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
         b_s = tl.where((b_pos[:, None] >= o_k[None, :]) & m_k[None, :] & m_q[:, None], b_s, float('-inf'))
         b_p = exp2(b_s - b_lse[:, None])
-        # [BT, BV] @ [BV, BS] -> [BT, BS]
         b_dp = tl.dot(b_do, b_v)
         b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
-        # [BT, BS] @ [BS, BK] -> [BT, BK]
         b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
 
     b_dq *= scale
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
 
 
-# ============================================================================
-# backward dkv: grid over kv blocks; iterate compressed-query blocks of the seq
-# ============================================================================
 @triton.jit(do_not_specialize=['Tq_total'])
 def sq_full_attn_bwd_kernel_dkv(
     q,
@@ -282,7 +239,7 @@ def sq_full_attn_bwd_kernel_dkv(
     dk,
     dv,
     pos_ids,
-    q_start_blk,   # int32 [NTk] first compressed-query LOCAL block to consider
+    q_start_blk,   # int32 [NTk] first compressed-query block to consider
     scale,
     cu_seqlens_q,
     cu_seqlens_k,
@@ -311,7 +268,6 @@ def sq_full_attn_bwd_kernel_dkv(
     Tq = eos_q - bos_q
     Tk = eos_k - bos_k
 
-    # kv block (key positions), block size BT along kv
     p_k = tl.make_block_ptr(k + (bos_k * H + i_h) * K, (Tk, K), (H * K, 1), (i_tl * BT, 0), (BT, BK), (1, 0))
     p_v = tl.make_block_ptr(v + (bos_k * H + i_h) * V, (Tk, V), (H * V, 1), (i_tl * BT, i_v * BV), (BT, BV), (1, 0))
     p_dk = tl.make_block_ptr(dk + (bos_k * HQ + i_hq) * K, (Tk, K), (HQ * K, 1), (i_tl * BT, 0), (BT, BK), (1, 0))
@@ -322,23 +278,15 @@ def sq_full_attn_bwd_kernel_dkv(
     b_dk = tl.zeros([BT, BK], dtype=tl.float32)
     b_dv = tl.zeros([BT, BV], dtype=tl.float32)
 
-    # key positions for this block
     o_k = i_tl * BT + tl.arange(0, BT)
     m_kk = o_k < Tk
 
-    # Iterate compressed-query rows of this sequence in BS strides, split into
-    # two stages:
-    #   stage 1 = diagonal region [j0, j_end), where the causal boundary cuts
-    #             through -> apply the causal mask;
-    #   stage 2 = fully-causal region [j_end, nq_blk), where every query has
-    #             pos > P0+BT-1 -> no causal mask needed.
-    # The diagonal covers <= BT queries but can straddle two BT-blocks due to
-    # misalignment, so j_end = j0 + 2 always suffices (no second searchsorted).
+    # The causal boundary spans at most two compressed-query blocks.
     j0 = tl.load(q_start_blk + i_t).to(tl.int32)
     nq_blk = tl.cdiv(Tq, BT)
     j_end = tl.minimum(j0 + 2, nq_blk)
 
-    # stage 1: diagonal region -> apply causal mask on real positions.
+    # Apply the causal mask in the diagonal region.
     for i_s in range(j0 * BT, j_end * BT, BS):
         o_qi = i_s + tl.arange(0, BS)
         m_q = o_qi < Tq
@@ -354,19 +302,15 @@ def sq_full_attn_bwd_kernel_dkv(
         b_lse = tl.load(p_lse, boundary_check=(0,))
         b_delta = tl.load(p_delta, boundary_check=(0,))
 
-        # [BT, BS]
         b_s = tl.dot(b_k, tl.trans(b_q)) * scale * RCP_LN2
         b_p = tl.where((o_k[:, None] <= b_pos[None, :]) & m_q[None, :] & m_kk[:, None],
                        exp2(b_s - b_lse[None, :]), 0)
-        # [BT, BS] @ [BS, BV] -> [BT, BV]
         b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
-        # [BT, BV] @ [BV, BS] -> [BT, BS]
         b_dp = tl.dot(b_v, tl.trans(b_do))
         b_ds = b_p * (b_dp - b_delta[None, :])
-        # [BT, BS] @ [BS, BK] -> [BT, BK]
         b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
 
-    # stage 2: fully-causal region -> no causal mask (only the query-length bound).
+    # Remaining query blocks are fully causal.
     for i_s in range(j_end * BT, nq_blk * BT, BS):
         o_qi = i_s + tl.arange(0, BS)
         m_q = o_qi < Tq
@@ -381,15 +325,11 @@ def sq_full_attn_bwd_kernel_dkv(
         b_lse = tl.load(p_lse, boundary_check=(0,))
         b_delta = tl.load(p_delta, boundary_check=(0,))
 
-        # [BT, BS]
         b_s = tl.dot(b_k, tl.trans(b_q)) * scale * RCP_LN2
         b_p = tl.where(m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
-        # [BT, BS] @ [BS, BV] -> [BT, BV]
         b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
-        # [BT, BV] @ [BV, BS] -> [BT, BS]
         b_dp = tl.dot(b_v, tl.trans(b_do))
         b_ds = b_p * (b_dp - b_delta[None, :])
-        # [BT, BS] @ [BS, BK] -> [BT, BK]
         b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
 
     b_dk *= scale
@@ -397,9 +337,6 @@ def sq_full_attn_bwd_kernel_dkv(
     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
 
-# ============================================================================
-# python wrappers
-# ============================================================================
 def _fwd(q_sel, k, v, pos_ids, scale, sel: SelInfo):
     Sq, HQ, K = q_sel.shape
     Tk_total, H, V = v.shape
@@ -438,22 +375,14 @@ def _compute_q_start_blk(pos_ids, sel: SelInfo, chunk_indices_k, BT):
     """First compressed-query block (in BT units) that a kv chunk can attend to.
 
     For each kv chunk row, find the first compressed query with real position
-    `pos >= kv_block_start`; its block index is the dkv inner-loop start `j0`
-    (the diagonal end is derived in-kernel as `j0 + 2`). Precomputed host-side so
-    the kernel loops only over the causally-relevant q range instead of branching
-    over every leading block.
-
-    Returns `q_start` of shape [NTk] (int32).
+    `pos >= kv_block_start`.
     """
     NTk = chunk_indices_k.shape[0]
     device = pos_ids.device
     if NTk == 0:
         return torch.empty(0, dtype=torch.int32, device=device)
 
-    # `pos_ids` is ascending only *within* each sequence segment, so a plain
-    # searchsorted would cross segment boundaries. Offset every segment by a
-    # per-sequence stride (`seg_id * BIG`) to make the keys globally ascending,
-    # then a single searchsorted lands in the correct segment.
+    # Offset positions by sequence so searchsorted cannot cross segments.
     cu_q = sel.cu_seqlens_q.to(torch.int64)                  # [Nseq+1]
     i_n = chunk_indices_k[:, 0].to(torch.int64)              # [NTk] sequence id
     i_tl = chunk_indices_k[:, 1].to(torch.int64)             # [NTk] kv block id
@@ -479,6 +408,7 @@ def _bwd(q_sel, k, v, o_sel, lse, do_sel, pos_ids, scale, sel: SelInfo):
     G = HQ // H
     BT, BS, BK, BV, num_warps = get_bwd_config(K, V, q_sel.device.index or 0)
     NV = triton.cdiv(V, BV)
+    assert NV == 1, "V must fit in a single block for the backward kernels"
 
     chunk_indices_q = prepare_chunk_indices(sel.cu_seqlens_q, BT)
     chunk_indices_k = prepare_chunk_indices(sel.cu_seqlens_k, BT)
@@ -511,7 +441,6 @@ def _bwd(q_sel, k, v, o_sel, lse, do_sel, pos_ids, scale, sel: SelInfo):
             num_warps=num_warps,
         )
 
-    # GQA reduce over groups
     dk = reduce(dk, 't (h g) k -> t h k', g=G, reduction='sum')
     dv = reduce(dv, 't (h g) v -> t h v', g=G, reduction='sum')
     return dq, dk, dv
@@ -523,7 +452,6 @@ class SQFullAttentionFunction(torch.autograd.Function):
     @contiguous
     @autocast_custom_fwd
     def forward(ctx, q, k, v, scale, sel: SelInfo):
-        # q: [B,T,HQ,K]  k,v: [B,T,H,*]
         B, T, HQ, K = q.shape
         _, _, H, V = v.shape
         q_flat = q.reshape(B * T, HQ, K)
@@ -587,7 +515,6 @@ def sq_full_attn(
     """
     B, T, HQ, K = q.shape
     H = k.shape[2]
-    # entry-point checks only (kept out of the hot path)
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4, "q/k/v must be [B, T, H, D]"
     assert HQ % H == 0, "HQ must be a multiple of H (GQA)"
     assert selection.dtype == torch.bool and selection.shape == (B, T), "selection must be a bool mask [B, T]"

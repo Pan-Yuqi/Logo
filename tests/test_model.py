@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Smoke test for the LoGo model.
+"""Basic test for the LoGo model.
 
 Builds the reference model from ``configs/config_1b5.json`` and exercises the
 training forward (dense + packed ``cu_seqlens``) and the inference ``generate``
@@ -63,5 +63,5 @@ def main():
 
 if __name__ == "__main__":
     if not torch.cuda.is_available():
-        raise SystemExit("This smoke test requires a CUDA GPU (flash-attn + Triton kernels).")
+        raise SystemExit("This test requires a CUDA GPU (flash-attn + Triton kernels).")
     main()

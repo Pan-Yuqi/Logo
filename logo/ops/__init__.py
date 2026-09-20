@@ -1,12 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LoGo operators: selected-query full causal attention.
-
-Only the query tokens selected by the per-token gate participate in the full
-causal attention; unselected query rows produce zero output / zero gradient,
-saving compute proportionally to the masked fraction. This is the query-sparse
-global branch that turns LoGo's reduced global-attention budget into a practical
-speedup.
-"""
+"""Selected-query full-attention operators for LoGo."""
 
 from .common import (
     SelInfo,

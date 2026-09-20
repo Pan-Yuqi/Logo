@@ -28,36 +28,21 @@ information.
 ```
 LoGo/
 ├── logo/
-│   ├── __init__.py                 # package exports + Auto* registration
 │   ├── configuration_logo.py       # LoGoConfig
 │   ├── modeling_logo.py            # LoGoModel / LoGoForCausalLM
-│   ├── cache.py                    # local/global KV cache utilities
-│   ├── layers/
-│   │   ├── attn.py                 # standard full-attention layer
-│   │   ├── logo.py                 # LoGo attention layer
-│   │   └── utils.py                # flash-attention dispatch helpers
-│   ├── modules/
-│   │   ├── layernorm.py            # RMSNorm
-│   │   ├── rotary.py               # rotary position embedding
-│   │   └── mlp.py                  # SwiGLU MLP
-│   └── ops/
-│       ├── selected_full_attn.py   # query-sparse full attention
-│       ├── dense_full_attn.py      # dense reference implementation
-│       ├── common.py               # selection and launch helpers
-│       └── triton_utils.py         # Triton helper functions
-├── configs/
-│   └── config_1b5.json             # reference 1.5B configuration
-├── tests/
-│   └── test_model.py               # build / forward / generation smoke test
-├── requirements.txt
-├── setup.py
-└── LICENSE
+│   ├── cache.py                    # KV cache
+│   ├── update.py                   # budget controller
+│   ├── layers/                     # attention layers
+│   ├── modules/                    # model components
+│   └── ops/                        # query-sparse Triton kernels
+├── configs/config_1b5.json         # reference 1.5B configuration
+└── tests/test_model.py             # basic model test
 ```
 
 ## Installation
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/Pan-Yuqi/Logo.git LoGo
 cd LoGo
 pip install -e .
 pip install flash-attn --no-build-isolation
@@ -66,10 +51,11 @@ pip install flash-attn --no-build-isolation
 Main requirements:
 
 - Python >= 3.9
-- PyTorch >= 2.1
+- PyTorch >= 2.4
 - Transformers >= 4.44 and < 4.52
 - Triton >= 3.0
-- flash-attn >= 2.1
+- einops >= 0.7
+- flash-attn >= 2.3.2
 
 The flash-attention and Triton paths require a CUDA GPU.
 
@@ -126,19 +112,48 @@ Setting `sparse_full_attn_backend="triton"` enables `logo.ops.sq_full_attn`,
 which computes full-context attention only for selected query rows while
 preserving dense-attention semantics on those rows.
 
-## Smoke Test
+## Training-Time Budget Control
+
+LoGo controls the global-attention budget by adjusting each layer's gate
+threshold. Call `update_gate_thres` after each optimizer update:
+
+```python
+from logo import update_gate_thres
+
+loss.backward()
+optimizer.step()
+
+update_gate_thres(
+    model,
+    target_global_ratio=0.5,
+    update_rate=0.0005,
+)
+optimizer.zero_grad()
+```
+
+The function supports both single-GPU and distributed training.
+
+## Test
 
 ```bash
 python tests/test_model.py
 ```
 
-The smoke test builds the reference model and checks regular training forward,
-packed variable-length forward with `cu_seqlens`, and generation paths. It
-requires a CUDA GPU with flash-attention and Triton installed.
+The test covers regular training forward, packed variable-length forward with
+`cu_seqlens`, and generation.
 
 ## Citation
 
-TODO: add BibTeX after the paper/arXiv version is available.
+If you find LoGo useful in your research, please cite:
+
+```bibtex
+@article{pan2026logo,
+  title={LoGo: Token-Level Dynamic Local-Global Attention},
+  author={Pan, Yuqi and Li, Zheng and Tang, Bohao and Qin, Zhen and Li, Guoqi},
+  journal={arXiv preprint arXiv:2608.29539},
+  year={2026}
+}
+```
 
 ## License
 

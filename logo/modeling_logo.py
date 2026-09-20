@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch LoGo (Local-Global hybrid attention) model."""
+"""PyTorch implementation of LoGo token-level dynamic local-global attention."""
 
 import math
 from typing import List, Optional, Tuple, Union
@@ -44,7 +44,7 @@ class LoGoDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        # attn_type_list[layer_idx] == 0 -> LoGo hybrid attention, else standard attention.
+        # attn_type_list[layer_idx] == 0 -> LoGo attention, else standard attention.
         if config.attn_type_list[layer_idx] == 0:
             self.self_attn = LoGoAttention(config=config, layer_idx=layer_idx)
         else:

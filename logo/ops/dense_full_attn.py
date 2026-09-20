@@ -1,13 +1,5 @@
 # -*- coding: utf-8 -*-
-# Dense reference for the LoGo selected-query full-attention operator.
-#
-# `sq_full_attn_dense_ref` runs the SAME Triton kernels as the optimized op but
-# with a full (all-ones) selection, so every token is a "selected" query. This
-# reproduces standard full causal attention while sharing the exact kernel
-# binary / accumulation order, making selected-row bitwise comparison auditable.
-#
-# `sdpa_causal_ref` is an independent absolute-correctness reference based on
-# torch SDPA (not bitwise; used for a sanity cross-check).
+"""Dense references for selected-query full attention."""
 
 from typing import Optional
 
@@ -31,7 +23,6 @@ def sq_full_attn_dense_ref(
 
 
 def _repeat_kv(x: torch.Tensor, g: int) -> torch.Tensor:
-    # x: [B, T, H, D] -> [B, T, H*g, D]
     B, T, H, D = x.shape
     return x[:, :, :, None, :].expand(B, T, H, g, D).reshape(B, T, H * g, D)
 
@@ -63,7 +54,7 @@ def sdpa_causal_ref(
         o = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True, scale=scale)
         return o.transpose(1, 2).contiguous()
 
-    # varlen (B==1): block-diagonal causal mask per sequence
+    # Apply causal attention independently to each packed sequence.
     assert B == 1
     cu = cu_seqlens.tolist()
     outs = []

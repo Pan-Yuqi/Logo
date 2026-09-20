@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LoGo (Local-Global hybrid attention) model configuration."""
+"""Configuration for LoGo token-level dynamic local-global attention."""
 
 from typing import List, Optional
 
@@ -10,7 +10,7 @@ __all__ = ["LoGoConfig"]
 
 
 class LoGoConfig(PretrainedConfig):
-    r"""Configuration for the LoGo local-global hybrid-attention model.
+    r"""Configuration for the LoGo token-level dynamic local-global attention model.
 
     LoGo runs every token through sliding-window (local) attention, while a
     learned per-token scalar gate additionally routes selected tokens through
@@ -59,7 +59,7 @@ class LoGoConfig(PretrainedConfig):
         resid_pdrop (`float`, *optional*, defaults to 0.0):
             Residual dropout probability.
         attn_type_list (`List[int]`, *optional*):
-            Per-layer attention type: `0` selects the LoGo hybrid attention,
+            Per-layer attention type: `0` selects LoGo attention,
             any other value selects standard full attention. Defaults to all
             zeros (every layer is a LoGo layer).
         window_size (`int`, *optional*, defaults to 128):

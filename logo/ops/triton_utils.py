@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Small, self-contained Triton / autograd helpers for the LoGo operators.
-
-These utilities are lightweight ports of a handful of helpers that the selected
-full-attention kernels rely on, kept local so the ``logo.ops`` package has no
-external dependency beyond ``torch`` and ``triton``.
-"""
+"""Triton and autograd helpers for LoGo operators."""
 
 import functools
 from enum import Enum
@@ -22,16 +17,10 @@ __all__ = [
     "check_shared_mem",
 ]
 
-# ----------------------------------------------------------------------------
-# Triton math intrinsics
-# ----------------------------------------------------------------------------
 exp2 = tl.math.exp2
 log2 = tl.log2
 
 
-# ----------------------------------------------------------------------------
-# autograd helpers
-# ----------------------------------------------------------------------------
 def contiguous(fn):
     """Make every tensor argument contiguous before calling ``fn``.
 
@@ -55,9 +44,6 @@ autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type="cuda"
 autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type="cuda")
 
 
-# ----------------------------------------------------------------------------
-# shared-memory capacity probe (used to pick block sizes per GPU arch)
-# ----------------------------------------------------------------------------
 class _Backend(Enum):
     ADA = 101376       # RTX 4090
     AMPERE = 166912    # A100

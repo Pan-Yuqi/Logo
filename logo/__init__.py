@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LoGo: a Local-Global hybrid sliding-window / full-attention language model."""
+"""LoGo: Token-Level Dynamic Local-Global Attention."""
 
 from transformers import (
     AutoConfig,
@@ -15,6 +15,7 @@ from logo.modeling_logo import (
     LoGoModel,
     LoGoPreTrainedModel,
 )
+from logo.update import update_gate_thres
 
 AutoConfig.register(LoGoConfig.model_type, LoGoConfig)
 AutoModel.register(LoGoConfig, LoGoModel)
@@ -30,4 +31,5 @@ __all__ = [
     "LoGoModel",
     "LoGoPreTrainedModel",
     "LoGoForCausalLM",
+    "update_gate_thres",
 ]

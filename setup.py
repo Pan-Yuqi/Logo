@@ -22,17 +22,18 @@ setup(
     name="logo-attn",
     version="0.1.0",
     description="LoGo: Token-Level Dynamic Local-Global Attention",
+    url="https://github.com/Pan-Yuqi/Logo",
     long_description=long_description,
     long_description_content_type="text/markdown",
     packages=find_packages(exclude=("tests", "configs")),
     install_requires=[
-        "torch>=2.1.0",
+        "torch>=2.4.0",
         "transformers>=4.44.0,<4.52.0",
         "triton>=3.0.0",
         "einops>=0.7.0",
     ],
     extras_require={
-        "flash": ["flash-attn>=2.1.0"],
+        "flash": ["flash-attn>=2.3.2"],
     },
     python_requires=">=3.9",
 )

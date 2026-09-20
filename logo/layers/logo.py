@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LoGo local-global hybrid attention layer.
+"""LoGo token-level dynamic local-global attention layer.
 
 Every token attends locally through a sliding window (SWA); a learned per-token
 scalar gate additionally routes tokens through full (global) attention. The two
@@ -32,7 +32,7 @@ __all__ = ["LoGoAttention"]
 
 
 class LoGoAttention(Attention):
-    """Local-global hybrid attention with a per-token global gate."""
+    """Token-level dynamic local-global attention."""
 
     def __init__(self, config, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
@@ -40,9 +40,8 @@ class LoGoAttention(Attention):
         self.local_window_size = config.window_size
         self.global_qk_param = config.global_qk_param
 
-        # --- global-branch q/k/v re-parameterization ---
+        # Global Q/K/V reparameterization
         if self.global_qk_param == "scale_offset":
-            # per-channel affine (scale + offset) applied to the base q/k/v
             self.q_global_scale = nn.Parameter(torch.ones(self.num_heads * self.head_dim))
             self.q_global_offset = nn.Parameter(torch.zeros(self.num_heads * self.head_dim))
             self.k_global_scale = nn.Parameter(torch.ones(self.num_key_value_heads * self.head_dim))
@@ -51,7 +50,6 @@ class LoGoAttention(Attention):
             self.v_global_offset = nn.Parameter(torch.zeros(self.num_key_value_heads * self.head_dim))
             self._transform_qkv = self._scale_offset_qkv
         elif self.global_qk_param == "linear_proj":
-            # per-head mixing matrix, initialized to identity to match SWA at init
             self.q_global_proj = nn.Parameter(torch.empty(self.num_heads, self.head_dim, self.head_dim))
             self.k_global_proj = nn.Parameter(torch.empty(self.num_key_value_heads, self.head_dim, self.head_dim))
             self.v_global_proj = nn.Parameter(torch.empty(self.num_key_value_heads, self.head_dim, self.head_dim))
@@ -64,16 +62,13 @@ class LoGoAttention(Attention):
                 proj.data.copy_(proj[0].unsqueeze(0).repeat(n_heads, 1, 1))
             self._transform_qkv = self._linear_proj_qkv
 
-        # gate projection (per-token scalar)
         self.gate_proj = nn.Linear(self.hidden_size, 1, bias=False)
 
-        # per-branch context normalization
         self.use_context_norm = config.use_context_norm
         if self.use_context_norm:
             self.context_norm_local = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.context_norm_global = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # token-level span budget (query-only sparsification)
         self.sparse_full_attn_backend = config.sparse_full_attn_backend
         self.register_buffer("gate_thres", torch.full((1,), config.gate_thres_init))
         self.register_buffer("gate_avg", torch.zeros(1), persistent=False)
@@ -82,9 +77,6 @@ class LoGoAttention(Attention):
 
         self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
 
-    # ------------------------------------------------------------------
-    # global-branch q/k/v transforms (all take/return [b, s, d] tensors)
-    # ------------------------------------------------------------------
     def _scale_offset_qkv(self, q, k, v):
         q = q * self.q_global_scale.view(1, 1, -1) + self.q_global_offset.view(1, 1, -1)
         k = k * self.k_global_scale.view(1, 1, -1) + self.k_global_offset.view(1, 1, -1)
@@ -101,7 +93,6 @@ class LoGoAttention(Attention):
         v_out = torch.einsum("b l h d, h d e -> b l h e", v_view, self.v_global_proj)
         return q_out.reshape(bsz, q_len, -1), k_out.reshape(bsz, q_len, -1), v_out.reshape(bsz, q_len, -1)
 
-    # ------------------------------------------------------------------
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -153,7 +144,7 @@ class LoGoAttention(Attention):
                 attn_state_full=(global_key_states, global_value_states),
                 layer_idx=self.layer_idx,
                 offset=q_len,
-                cache_kwargs={},
+                cache_kwargs={"window_size": self.local_window_size},
             )
             key_states, value_states = state["attn_state"]
             global_key_states, global_value_states = state["attn_state_full"]
@@ -168,12 +159,15 @@ class LoGoAttention(Attention):
 
         dropout_rate = self.attention_dropout if self.training else 0.0
 
-        # ---- local (sliding-window) branch: every token participates ----
+        # Local sliding-window attention
+        local_attention_mask = attention_mask
+        if local_attention_mask is not None and local_attention_mask.shape[-1] != key_states.shape[1]:
+            local_attention_mask = local_attention_mask[:, -key_states.shape[1]:]
         local_attn_output = flash_attention_forward(
             query_states,
             key_states,
             value_states,
-            attention_mask,
+            local_attention_mask,
             q_len,
             position_ids=position_ids,
             cu_seqlens=cu_seqlens,
@@ -187,16 +181,14 @@ class LoGoAttention(Attention):
             local_attn_output = self.context_norm_local(local_attn_output)
         local_attn_output = local_attn_output.reshape(bsz, q_len, -1).contiguous()
 
-        # ---- global (full) branch: gated, query-sparse span budget ----
+        # Gated global attention
         is_decode = past_key_value is not None and q_len == 1
         use_triton = self.sparse_full_attn_backend == "triton" and not is_decode
 
         if not is_decode:
-            # prefill / training path
             if use_triton:
                 selection = gate.squeeze(-1) >= self.gate_thres
                 if cu_seqlens is not None:
-                    # already packed varlen (bsz == 1)
                     global_attn_output = sq_full_attn(
                         global_query_states,
                         global_key_states,
@@ -205,7 +197,7 @@ class LoGoAttention(Attention):
                         cu_seqlens=cu_seqlens,
                     )
                 else:
-                    # equal-length batch (bsz > 1): pack into [1, bsz*q_len]
+                    # Pack an equal-length batch for the varlen Triton kernel.
                     q_p = global_query_states.reshape(1, bsz * q_len, self.num_heads, self.head_dim)
                     k_p = global_key_states.reshape(1, bsz * q_len, self.num_key_value_heads, self.head_dim)
                     v_p = global_value_states.reshape(1, bsz * q_len, self.num_key_value_heads, self.head_dim)
@@ -234,7 +226,6 @@ class LoGoAttention(Attention):
                 global_attn_output = self.context_norm_global(global_attn_output)
             global_attn_output = global_attn_output.reshape(bsz, q_len, -1).contiguous()
         else:
-            # decode path (q_len == 1): run the global branch only if the token is active
             active = gate >= self.gate_thres
             if active.any():
                 global_attn_output = flash_attention_forward(
@@ -257,7 +248,6 @@ class LoGoAttention(Attention):
             else:
                 global_attn_output = global_query_states.new_zeros(bsz, q_len, self.num_heads * self.head_dim)
 
-        # token-level span budget: only tokens above threshold keep the global path
         if self.training:
             with torch.no_grad():
                 self.gate_avg.add_(gate.sum())
