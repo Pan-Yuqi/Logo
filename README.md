@@ -7,6 +7,8 @@ token receives efficient local attention, while a learned gate selectively
 activates full-context global attention for tokens requiring long-range
 information.
 
+[[Paper](https://arxiv.org/abs/2608.29539)]
+
 ![LoGo overview](assets/logo_main.png)
 
 ## Highlights
@@ -58,6 +60,14 @@ Main requirements:
 - flash-attn >= 2.3.2
 
 The flash-attention and Triton paths require a CUDA GPU.
+
+### Tested Environment
+
+- Python 3.11.2
+- PyTorch 2.7.0+cu128
+- Transformers 4.51.3
+- Triton 3.3.0
+- FlashAttention 2.5.8
 
 ## Quickstart
 
